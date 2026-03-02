@@ -1,39 +1,29 @@
 #!/usr/bin/bash
 
-set -x
-
-umask 007
- 
-NGPU=${NGPU:-"8"}
-MASTER_PORT=${MASTER_PORT:-"29501"}
-PORT=${PORT:-"1106"}
-LOG_RANK=${LOG_RANK:-"0"}
+NGPU=${PET_NPROC_PER_NODE:-"8"}
+NNODES=${PET_NNODES:-"1"}
+NODE_RANK=${PET_NODE_RANK:-"0"}
+MASTER_ADDR=${PET_MASTER_ADDR:-"127.0.0.1"}
+MASTER_PORT=${PET_MASTER_PORT:-"29501"}
 TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE:-"http://localhost:29510"}
-CONFIG_NAME=${CONFIG_NAME:-"robotwin_train"}
+CONFIG_NAME=${CONFIG_NAME:-"flexiv_train"}
 
-overrides=""
-if [ $# -ne 0 ]; then
-    overrides="$*"
-fi
+export NCCL_DEBUG=WARN
+# export TORCH_DISTRIBUTED_DEBUG=DETAIL
 
-export WANDB_API_KEY="your key"
-export WANDB_BASE_URL="your url"
-export WANDB_TEAM_NAME="your team name"
-export WANDB_PROJECT="your project"
+readonly PROJ="/inspire/hdd/global_user/liuhairuo-253208120281"
+export HF_LEROBOT_HOME="${PROJ}/cache/huggingface/lerobot"
+export CACHE_ROOT="${PROJ}/cache"
+source "${PROJ}/miniconda3/bin/activate"
+conda activate lingbot-va
+cd "${PROJ}/lingbot-va"
 
-## node setting
-num_gpu=${NGPU}
-master_port=${MASTER_PORT}
-log_rank=${LOG_RANK}
-torchft_lighthouse=${TORCHFT_LIGHTHOUSE}
-config_name=${CONFIG_NAME}
-
-## cmd setting
 export TOKENIZERS_PARALLELISM=false
-PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" TORCHFT_LIGHTHOUSE=${torchft_lighthouse} \
+PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE} \
 python -m torch.distributed.run \
-    --nproc_per_node=${num_gpu} \
-    --local-ranks-filter=${log_rank} \
-    --master_port ${master_port} \
-    --tee 3 \
-    -m wan_va.train --config-name ${config_name} $overrides
+    --nnodes=${NNODES} \
+    --nproc_per_node=${NGPU} \
+    --node_rank=${NODE_RANK} \
+    --master_addr=${MASTER_ADDR} \
+    --master_port ${MASTER_PORT} \
+    -m wan_va.train --config-name ${CONFIG_NAME} "$@"

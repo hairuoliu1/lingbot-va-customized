@@ -130,7 +130,7 @@ h5py
 azure==4.0.0
 azure-ai-inference
 pyglet<2
-wandb
+tensorboard
 moviepy
 imageio
 termcolor
@@ -201,7 +201,7 @@ We support post-training (fine-tuning) LingBot-VA on custom robotic manipulation
 On top of the base installation, post-training requires:
 
 ```bash
-pip install lerobot==0.3.3 scipy wandb --no-deps
+pip install lerobot==0.3.3 scipy tensorboard --no-deps
 ```
 
 ### Data Preparation
@@ -534,3 +534,80 @@ For questions, discussions, or collaborations:
 
 - **Issues**: Open an [issue](https://github.com/robbyant/lingbot-va/issues) on GitHub
 - **Email**: Contact Dr. [Qihang Zhang](https://zqh0253.github.io/) (liuhuan.zqh@antgroup.com) or Dr. [Lin Li](https://lilin-hitcrt.github.io/) (fengchang.ll@antgroup.com) 
+
+---
+
+### 一、 环境与依赖准备
+1. **安装依赖**：
+   在 `Wan2.2/` 目录下执行以下命令安装依赖：
+   ```bash
+   pip install -r requirements.txt
+   ```
+   *注：官方要求 `torch >= 2.4`。如果 `flash_attn` 安装失败，建议先安装其他包，最后再单独安装它。*
+
+2. **下载 VAE 权重**：
+   直接从官方轻量 VAE 资源库获取 `Wan2.2_VAE.pth`（或 `.safetensors`）。可以使用以下命令下载到指定目录：
+   ```bash
+   huggingface-cli download lightx2v/Autoencoders Wan2.2_VAE.pth --local-dir Wan2.2/checkpoints
+   ```
+
+### 二、 VAE 特性与数据结构
+1. **VAE 压缩比**：
+   Wan2.2 的 VAE 在时间（T）、高度（H）、宽度（W）上的压缩比为 \(4 \times 16 \times 16\)。因此，输出的 latent 尺寸约为 \(T/4 \times H/16 \times W/16\)。建议将视频预处理至约 `256x256` 分辨率和 `5-15 fps`，以控制 latent 的体积。
+2. **目录结构（遵循 LeRobot 规范）**：
+   * **视频源路径**：`videos/chunk-000/observation.images.cam_high/episode_000000.mp4`
+   * **Latent 保存路径**：`latents/chunk-000/observation.images.cam_high/episode_000000_<start>_<end>.pth`
+   * **元数据**：命名需与 `meta/episodes.jsonl` 中的 `action_config`（包含 `start_frame` / `end_frame`）保持严格匹配。
+
+### 三、 Latent 提取脚本开发思路
+建议编写一个提取脚本（如 `scripts/extract_latents.py`），核心流程如下：
+
+1. **读取元数据**：解析 `episodes.jsonl`，遍历每个 episode 的视频片段配置。
+2. **视频预处理**：使用 `decord` 或 `ffmpeg` 按目标 fps 采样视频，将画面 Resize 到 `256x256`，并转换为形状为 `[C, T, H, W]` 的 `torch.Tensor`，数值缩放至 `[-1, 1]`。
+3. **实例化 VAE**：
+   ```python
+   from wan.modules.vae2_2 import Wan2_2_VAE
+   vae = Wan2_2_VAE(vae_pth="Wan2.2/checkpoints/Wan2.2_VAE.pth", dtype=torch.bfloat16, device="cuda")
+   ```
+4. **编码与展平**：
+   ```python
+   latent_4d = vae.encode([video_tensor])[0] # 得到形状 [C, T', H', W']
+   # 按训练规范展平成 token
+   latent = latent_4d.permute(1, 2, 3, 0).reshape(-1, latent_4d.shape[0])
+   ```
+5. **保存数据字典**：
+   将处理好的数据打包并保存为 `.pth` 文件（保存前需确保目标目录存在）：
+   ```python
+   torch.save({
+       "latent": latent,                     # [N_tokens, C]
+       "latent_num_frames": latent_4d.shape[1],
+       "latent_height": latent_4d.shape[2],
+       "latent_width": latent_4d.shape[3],
+       "video_num_frames": len(frame_ids),
+       "video_height": orig_h, 
+       "video_width": orig_w,
+       "frame_ids": frame_ids,
+       "start_frame": s, 
+       "end_frame": e,
+       "fps": target_fps, 
+       "ori_fps": ori_fps,
+       # 可选：若需要文本描述，可额外写入 "text" 和 "text_emb"
+   }, save_path)
+   ```
+
+### 四、 运行示例与进阶配置
+**运行提取脚本**：
+```bash
+python scripts/extract_latents.py \
+  --dataset /path/to/your_dataset \
+  --vae_ckpt Wan2.2/checkpoints/Wan2.2_VAE.pth \
+  --camera observation.images.cam_high \
+  --fps 10 \
+  --size 256 \
+  --device cuda:0
+```
+
+**附加说明与小贴士**：
+* **文本嵌入（可选）**：如果需要保存 `text_emb`，可以使用 Wan2.2 自带的 T5 编码器（`umt5-xxl`）对 `action_text` 进行编码后存入字典；若暂不需要，可跳过或填入零向量。
+* **模型兼容性**：5B 版本的 VAE 文件在社区中常被命名为 `wan2.2_vae.safetensors`，放置在任何 `models/vae` 目录下均可被工具链加载。
+* **LightX2V 变体**：`LightX2V` 仓库提供了多种 VAE 变体（如官方版、优化版 LightVAE/TAE）。为了确保与 Wan2.2 主干网络严格匹配，请务必选择官方的 `Wan2.2_VAE`。

@@ -3,7 +3,7 @@ import argparse
 import os
 import sys
 from pathlib import Path
-import wandb
+from torch.utils.tensorboard import SummaryWriter
 
 import torch
 import torch.distributed as dist
@@ -49,24 +49,31 @@ import gc
 
 class Trainer:
     def __init__(self, config):
-        if config.enable_wandb and config.rank == 0:
-            wandb.login(host=os.environ['WANDB_BASE_URL'], key=os.environ['WANDB_API_KEY'])
-            self.wandb = wandb
-            self.wandb.init(
-                entity=os.environ["WANDB_TEAM_NAME"],
-                project=os.getenv("WANDB_PROJECT", "va_robotwin"),
-                # dir=log_dir,
-                config=config,
-                mode="online",
-                name='test_lln'
-                # name=os.path.basename(os.path.normpath(job_config.job.dump_folder))
-            )
-            logger.info("WandB logging enabled")
+        self.writer = None
+        self.enable_tensorboard = bool(getattr(config, "enable_tensorboard", False))
+        if self.enable_tensorboard and config.rank == 0:
+            log_dir = Path(config.save_root) / "tensorboard"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            self.writer = SummaryWriter(log_dir=log_dir)
+            logger.info(f"TensorBoard logging enabled at {log_dir}")
         self.step = 0
         self.config = config
         self.device = torch.device(f"cuda:{config.local_rank}")
         self.dtype = config.param_dtype
         self.patch_size = config.patch_size
+        self.sampler_seed = getattr(config, "sampler_seed", 42)
+        self.train_num_timesteps = getattr(config, "train_num_timesteps", 1000)
+        self.latent_noisy_cond_prob = getattr(config, "latent_noisy_cond_prob", 0.5)
+        self.action_noisy_cond_prob = getattr(config, "action_noisy_cond_prob", 0.0)
+        self.dataset_init_worker = getattr(config, "dataset_init_worker", 16)
+        self.chunk_size_min = getattr(config, "chunk_size_min", 1)
+        self.chunk_size_max = getattr(config, "chunk_size_max", 4)
+        self.window_size_min = getattr(config, "window_size_min", 4)
+        self.window_size_max = getattr(config, "window_size_max", 64)
+        self.max_grad_norm = getattr(config, "max_grad_norm", 2.0)
+        self.adam_eps = getattr(config, "adam_eps", 1e-8)
+        self.enable_cuda_sync_for_logging = bool(getattr(config, "enable_cuda_sync_for_logging", False))
+        self.enable_iter_barrier = bool(getattr(config, "enable_iter_barrier", False))
 
         # Load models
         logger.info("Loading models...")
@@ -107,7 +114,7 @@ class Trainer:
             [p for p in self.transformer.parameters() if p.requires_grad],
             lr=config.learning_rate,
             betas=(config.beta1, config.beta2),
-            eps=1e-8,
+            eps=self.adam_eps,
             weight_decay=config.weight_decay,
             fused=True,
             foreach=False,
@@ -118,13 +125,16 @@ class Trainer:
 
         # Setup dataloaders
         logger.info("Setting up datasets...")
-        train_dataset = MultiLatentLeRobotDataset(config=config)
+        train_dataset = MultiLatentLeRobotDataset(
+            config=config,
+            num_init_worker=self.dataset_init_worker,
+        )
         train_sampler = DistributedSampler(
             train_dataset,
             num_replicas=config.world_size,
             rank=config.rank,
             shuffle=True,
-            seed=42
+            seed=self.sampler_seed
         ) if config.world_size > 1 else None
         self.train_loader = DataLoader(
             train_dataset,
@@ -135,9 +145,9 @@ class Trainer:
         )
 
         self.train_scheduler_latent = FlowMatchScheduler(shift=self.config.snr_shift, sigma_min=0.0, extra_one_step=True)
-        self.train_scheduler_latent.set_timesteps(1000, training=True)
+        self.train_scheduler_latent.set_timesteps(self.train_num_timesteps, training=True)
         self.train_scheduler_action = FlowMatchScheduler(shift=self.config.action_snr_shift, sigma_min=0.0, extra_one_step=True)
-        self.train_scheduler_action.set_timesteps(1000, training=True)
+        self.train_scheduler_action.set_timesteps(self.train_num_timesteps, training=True)
 
         self.save_dir = Path(config.save_root) / "checkpoints"
         self.save_dir.mkdir(parents=True, exist_ok=True)
@@ -225,14 +235,14 @@ class Trainer:
             train_scheduler=self.train_scheduler_latent, 
             action_mask=None, 
             action_mode=False,
-            noisy_cond_prob=0.5)
+            noisy_cond_prob=self.latent_noisy_cond_prob)
         
         action_dict = self._add_noise(
             latent=batch_dict['actions'], 
             train_scheduler=self.train_scheduler_action, 
             action_mask=batch_dict['actions_mask'], 
             action_mode=True,
-            noisy_cond_prob=0.0)
+            noisy_cond_prob=self.action_noisy_cond_prob)
 
         latent_dict['text_emb'] = batch_dict['text_emb']
         action_dict['text_emb'] = batch_dict['text_emb']
@@ -241,8 +251,8 @@ class Trainer:
         input_dict = {
             'latent_dict': latent_dict,
             'action_dict': action_dict,
-            'chunk_size': torch.randint(1, 5, (1,)).item(),
-            'window_size': torch.randint(4, 65, (1,)).item(),
+            'chunk_size': torch.randint(self.chunk_size_min, self.chunk_size_max + 1, (1,)).item(),
+            'window_size': torch.randint(self.window_size_min, self.window_size_max + 1, (1,)).item(),
         }
         return input_dict
 
@@ -315,7 +325,7 @@ class Trainer:
         
         # Only update weights after accumulating gradients
         if should_sync:
-            total_norm = torch.nn.utils.clip_grad_norm_(self.transformer.parameters(), 2.0)
+            total_norm = torch.nn.utils.clip_grad_norm_(self.transformer.parameters(), self.max_grad_norm)
             self.optimizer.step()
             self.lr_scheduler.step()
             self.optimizer.zero_grad()
@@ -463,7 +473,8 @@ class Trainer:
                 accumulated_action_losses = []
                 step_in_accumulation = 0
 
-                torch.cuda.synchronize()
+                if self.enable_cuda_sync_for_logging:
+                    torch.cuda.synchronize()
                 if self.step % self.config.gc_interval == 0:
                     torch.cuda.empty_cache()
                     gc.collect()
@@ -478,15 +489,29 @@ class Trainer:
                         'grad_norm': f'{total_norm.item():.2f}',
                         'lr': f'{lr:.2e}'
                     })
-                    if self.config.enable_wandb:
-                        self.wandb.log({
-                            'loss_metrics/global_avg_video_loss': latent_loss_show,
-                            'loss_metrics/global_avg_action_loss': action_loss_show,
-                            'loss_metrics/global_max_video_loss': max_latent_loss_show,
-                            'loss_metrics/global_max_action_loss': max_action_loss_show,
-                            'grad_norm': total_norm.item(),
-                            'lr': lr,
-                        }, step=self.step)
+                    if self.writer is not None:
+                        self.writer.add_scalar(
+                            'loss_metrics/global_avg_video_loss',
+                            latent_loss_show,
+                            self.step,
+                        )
+                        self.writer.add_scalar(
+                            'loss_metrics/global_avg_action_loss',
+                            action_loss_show,
+                            self.step,
+                        )
+                        self.writer.add_scalar(
+                            'loss_metrics/global_max_video_loss',
+                            max_latent_loss_show,
+                            self.step,
+                        )
+                        self.writer.add_scalar(
+                            'loss_metrics/global_max_action_loss',
+                            max_action_loss_show,
+                            self.step,
+                        )
+                        self.writer.add_scalar('grad_norm', total_norm.item(), self.step)
+                        self.writer.add_scalar('lr', lr, self.step)
                 
                 self.step += 1
                 
@@ -495,11 +520,14 @@ class Trainer:
                         logger.info(f"Starting save model at step {self.step}")
                     self.save_checkpoint()
 
-            if dist.is_initialized():
+            if self.enable_iter_barrier and dist.is_initialized():
                 dist.barrier()
 
         progress_bar.close()
         logger.info("Training completed!")
+
+        if self.writer is not None:
+            self.writer.close()
 
 
 def run(args):

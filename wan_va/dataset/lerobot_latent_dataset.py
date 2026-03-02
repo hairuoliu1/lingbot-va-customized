@@ -18,7 +18,7 @@ from lerobot.constants import HF_LEROBOT_HOME
 def recursive_find_file(directory, filename='info.json'):
     result = []
     try:
-        for root, dirs, files in os.walk(directory):
+        for root, dirs, files in os.walk(directory, followlinks=True):
             if filename in files:
                 full_path = os.path.join(root, filename)
                 result.append(full_path)
@@ -71,7 +71,7 @@ class MultiLatentLeRobotDataset(torch.utils.data.Dataset):
     def __init__(
         self,
         config,
-        num_init_worker=128,
+        num_init_worker=16,
     ):
         self._datasets = construct_lerobot_multi_processor(config, 
                                                            num_init_worker, 
@@ -339,4 +339,3 @@ if __name__ == '__main__':
     action_all = torch.cat(action_list, dim=0)
     print(max_l)
     print(action_all.shape, action_all.mean(dim=0), action_all.min(dim=0)[0], action_all.max(dim=0)[0])
-    
