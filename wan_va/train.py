@@ -8,7 +8,9 @@ from torch.utils.tensorboard import SummaryWriter
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, DistributedSampler
+from diffusers.video_processor import VideoProcessor
+from diffusers.utils import export_to_video
+from torch.utils.data import DataLoader, DistributedSampler, Subset
 from tqdm import tqdm
 from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict,
@@ -32,6 +34,7 @@ from distributed.util import (
 from einops import rearrange
 from modules.utils import (
     load_transformer,
+    load_vae,
 )
 from utils import (
     init_logger, 
@@ -48,16 +51,38 @@ import gc
 
 
 class Trainer:
+    PREVIEW_VIDEO_FPS = 10
+
     def __init__(self, config):
+        self.config = config
+        self.step = 0
+        self.exp_name = getattr(config, "exp_name", "default_exp")
+        self.exp_dir = Path(config.save_root) / self.exp_name
+        self.exp_dir.mkdir(parents=True, exist_ok=True)
+        self.save_dir = self.exp_dir / "checkpoints"
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        self.train_state_dir = self.exp_dir / "train_state"
+        self.train_state_dir.mkdir(parents=True, exist_ok=True)
+        self.train_state_file = self.train_state_dir / "training_state.pt"
+        self.latest_checkpoint_file = self.train_state_dir / "latest_checkpoint.txt"
+        self.latest_checkpoint_link = self.save_dir / "latest"
+        self.auto_resume = bool(getattr(config, "auto_resume", True))
+        self.resume_from = getattr(config, "resume_from", None)
+        self.resume_checkpoint_dir = self._resolve_resume_checkpoint()
+        self.enable_preview_video = bool(getattr(config, "enable_preview_video", False))
+        self.preview_video_interval = int(getattr(config, "preview_video_interval", 1000))
+        self.preview_video_dir = self.exp_dir / "videos"
+        if self.enable_preview_video:
+            self.preview_video_dir.mkdir(parents=True, exist_ok=True)
+
         self.writer = None
         self.enable_tensorboard = bool(getattr(config, "enable_tensorboard", False))
         if self.enable_tensorboard and config.rank == 0:
-            log_dir = Path(config.save_root) / "tensorboard"
+            log_dir = self.exp_dir / "tensorboard"
             log_dir.mkdir(parents=True, exist_ok=True)
             self.writer = SummaryWriter(log_dir=log_dir)
             logger.info(f"TensorBoard logging enabled at {log_dir}")
-        self.step = 0
-        self.config = config
+
         self.device = torch.device(f"cuda:{config.local_rank}")
         self.dtype = config.param_dtype
         self.patch_size = config.patch_size
@@ -74,6 +99,12 @@ class Trainer:
         self.adam_eps = getattr(config, "adam_eps", 1e-8)
         self.enable_cuda_sync_for_logging = bool(getattr(config, "enable_cuda_sync_for_logging", False))
         self.enable_iter_barrier = bool(getattr(config, "enable_iter_barrier", False))
+        self.enable_validation = bool(getattr(config, "enable_validation", True))
+        self.val_split_ratio = float(getattr(config, "val_split_ratio", 0.01))
+        self.val_interval = int(getattr(config, "val_interval", 1000))
+        self.val_eval_num_batches = int(getattr(config, "val_eval_num_batches", -1))
+        self.val_worker = int(getattr(config, "val_worker", config.load_worker))
+        self.keep_interval = int(getattr(config, "keep_interval", 0))
 
         # Load models
         logger.info("Loading models...")
@@ -81,8 +112,8 @@ class Trainer:
         # Load and shard transformer with FSDP
         logger.info("Loading transformer...")
 
-        if hasattr(config, 'resume_from') and config.resume_from:
-            transformer_path = os.path.join(config.resume_from, 'transformer')
+        if self.resume_checkpoint_dir is not None:
+            transformer_path = os.path.join(str(self.resume_checkpoint_dir), 'transformer')
             if config.rank == 0:
                 logger.info(f"Resuming from checkpoint: {transformer_path}")
         else:
@@ -108,6 +139,19 @@ class Trainer:
         )
         self.transformer.train()
         self.transformer.requires_grad_(True)
+        self.preview_vae = None
+        if self.enable_preview_video:
+            preview_vae_path = os.path.join(
+                config.wan22_pretrained_model_name_or_path,
+                "vae",
+            )
+            self.preview_vae = load_vae(
+                preview_vae_path,
+                torch_dtype=self.dtype,
+                torch_device=self.device,
+            )
+            self.preview_vae.eval().requires_grad_(False)
+            self.preview_video_processor = VideoProcessor(vae_scale_factor=1)
 
         # Optimizer
         self.optimizer = torch.optim.AdamW(
@@ -125,10 +169,12 @@ class Trainer:
 
         # Setup dataloaders
         logger.info("Setting up datasets...")
-        train_dataset = MultiLatentLeRobotDataset(
+        full_dataset = MultiLatentLeRobotDataset(
             config=config,
             num_init_worker=self.dataset_init_worker,
         )
+        train_dataset, val_dataset = self._split_train_val_dataset(full_dataset)
+
         train_sampler = DistributedSampler(
             train_dataset,
             num_replicas=config.world_size,
@@ -143,19 +189,92 @@ class Trainer:
             num_workers=config.load_worker,
             sampler=train_sampler,
         )
+        self.has_val_loader = val_dataset is not None and len(val_dataset) > 0
+        self.val_loader = None
+        self.val_preview_iter = None
+        if self.has_val_loader:
+            val_sampler = DistributedSampler(
+                val_dataset,
+                num_replicas=config.world_size,
+                rank=config.rank,
+                shuffle=False,
+                seed=self.sampler_seed,
+            ) if config.world_size > 1 else None
+            self.val_loader = DataLoader(
+                val_dataset,
+                batch_size=config.batch_size,
+                shuffle=False,
+                num_workers=self.val_worker,
+                sampler=val_sampler,
+            )
+            if self.config.rank == 0:
+                logger.info(f"Validation enabled: {len(val_dataset)} samples")
 
         self.train_scheduler_latent = FlowMatchScheduler(shift=self.config.snr_shift, sigma_min=0.0, extra_one_step=True)
         self.train_scheduler_latent.set_timesteps(self.train_num_timesteps, training=True)
         self.train_scheduler_action = FlowMatchScheduler(shift=self.config.action_snr_shift, sigma_min=0.0, extra_one_step=True)
         self.train_scheduler_action.set_timesteps(self.train_num_timesteps, training=True)
 
-        self.save_dir = Path(config.save_root) / "checkpoints"
-        self.save_dir.mkdir(parents=True, exist_ok=True)
-
         self.gradient_accumulation_steps = getattr(config, 'gradient_accumulation_steps', 1)
         self.train_loader_iter = None
-        # if hasattr(config, 'resume_from') and config.resume_from:
-        #     self._load_training_state(config.resume_from)
+        if self.resume_checkpoint_dir is not None:
+            self._load_training_state()
+
+    def _split_train_val_dataset(self, dataset):
+        if not self.enable_validation or self.val_split_ratio <= 0:
+            return dataset, None
+
+        dataset_len = len(dataset)
+        if dataset_len <= 1:
+            return dataset, None
+
+        val_size = max(1, int(dataset_len * self.val_split_ratio))
+        val_size = min(val_size, dataset_len - 1)
+        generator = torch.Generator()
+        generator.manual_seed(self.sampler_seed)
+        perm = torch.randperm(dataset_len, generator=generator).tolist()
+        val_indices = perm[:val_size]
+        train_indices = perm[val_size:]
+        train_subset = Subset(dataset, train_indices)
+        val_subset = Subset(dataset, val_indices)
+        if self.config.rank == 0:
+            logger.info(
+                f"Dataset split: train={len(train_subset)}, val={len(val_subset)}, "
+                f"val_ratio={self.val_split_ratio}"
+            )
+        return train_subset, val_subset
+
+    def _resolve_resume_checkpoint(self):
+        if self.resume_from:
+            checkpoint_dir = Path(self.resume_from)
+            return checkpoint_dir if checkpoint_dir.exists() else None
+
+        if not self.auto_resume:
+            return None
+
+        if self.train_state_file.exists():
+            try:
+                state = torch.load(self.train_state_file, map_location='cpu', weights_only=False)
+                latest_checkpoint = state.get("latest_checkpoint", "")
+                if latest_checkpoint:
+                    checkpoint_dir = Path(latest_checkpoint)
+                    if not checkpoint_dir.is_absolute():
+                        checkpoint_dir = self.exp_dir / "checkpoints" / latest_checkpoint
+                    if checkpoint_dir.exists():
+                        return checkpoint_dir
+            except Exception as e:
+                if self.config.rank == 0:
+                    logger.warning(f"Failed to parse train state for auto resume: {e}")
+
+        if self.latest_checkpoint_file.exists():
+            checkpoint_str = self.latest_checkpoint_file.read_text().strip()
+            if checkpoint_str:
+                checkpoint_dir = Path(checkpoint_str)
+                if not checkpoint_dir.is_absolute():
+                    checkpoint_dir = self.exp_dir / "checkpoints" / checkpoint_str
+                if checkpoint_dir.exists():
+                    return checkpoint_dir
+        return None
     
     def _get_next_batch(self):
         """Get next batch from iterator, reset if epoch is finished."""
@@ -345,10 +464,13 @@ class Trainer:
                 options=StateDictOptions(full_state_dict=True, cpu_offload=True),
             )
             state_dict_bf16 = {k: v.to(torch.bfloat16) for k, v in state_dict.items()}
-            # optim_state = get_optimizer_state_dict(
-            #         self.transformer, self.optimizer,
-            #         options=StateDictOptions(full_state_dict=True, cpu_offload=True),
-            #     )
+            optim_state = get_optimizer_state_dict(
+                self.transformer,
+                self.optimizer,
+                options=StateDictOptions(full_state_dict=True, cpu_offload=True),
+            )
+            optim_state = self._materialize_missing_optimizer_state(optim_state)
+            self._assert_optimizer_state_complete(optim_state)
 
             # Only rank 0 saves the checkpoint
             if self.config.rank == 0:
@@ -373,14 +495,18 @@ class Trainer:
                 with open(config_file, 'w') as f:
                     json.dump(config_dict, f, indent=2)
 
-                # # Save optimizer state and training metadata in PyTorch format
-                # training_state_path = checkpoint_dir / "training_state.pt"
-                # logger.info(f"Saving training state to {training_state_path}")
-                # torch.save({
-                #     'step': self.step,
-                #     'optimizer_state_dict': optim_state,
-                #     'config': vars(self.config),
-                # }, training_state_path)
+                state_payload = {
+                    'step': self.step,
+                    'optimizer_state_dict': optim_state,
+                    'latest_checkpoint': str(checkpoint_dir),
+                    'exp_name': self.exp_name,
+                }
+                tmp_state_file = self.train_state_file.with_suffix(".tmp")
+                torch.save(state_payload, tmp_state_file)
+                tmp_state_file.replace(self.train_state_file)
+                self.latest_checkpoint_file.write_text(str(checkpoint_dir))
+                self._update_latest_checkpoint_link(checkpoint_dir)
+                self._cleanup_checkpoints(current_step=self.step)
 
                 logger.info(f"Checkpoint saved successfully at step {self.step}")
 
@@ -397,34 +523,237 @@ class Trainer:
             if dist.is_initialized():
                 dist.barrier()
 
-    def _load_training_state(self, checkpoint_path):
-        """Load training state (optimizer + step) after FSDP and optimizer creation."""
-        checkpoint_dir = Path(checkpoint_path)
-        training_state_path = checkpoint_dir / "training_state.pt"
+    def _update_latest_checkpoint_link(self, checkpoint_dir: Path):
+        """Maintain checkpoints/latest -> latest checkpoint directory."""
+        link_path = self.latest_checkpoint_link
+        try:
+            if link_path.exists() or link_path.is_symlink():
+                link_path.unlink()
+            # Relative link keeps experiment directory movable.
+            os.symlink(checkpoint_dir.name, link_path)
+        except OSError as e:
+            logger.warning(f"Failed to update latest checkpoint symlink: {e}")
 
-        if not training_state_path.exists():
+    def _cleanup_checkpoints(self, current_step: int):
+        """Keep latest checkpoint and interval checkpoints; remove other old checkpoints."""
+        if self.keep_interval <= 0:
+            return
+        for ckpt_dir in self.save_dir.glob("checkpoint_step_*"):
+            if not ckpt_dir.is_dir():
+                continue
+            try:
+                step = int(ckpt_dir.name.replace("checkpoint_step_", ""))
+            except ValueError:
+                continue
+            if step == current_step or (step % self.keep_interval == 0):
+                continue
+            import shutil
+            shutil.rmtree(ckpt_dir, ignore_errors=True)
+
+    def _assert_optimizer_state_complete(self, optim_state_dict):
+        """Strictly require optimizer-state keys cover all params in param_groups."""
+        if not isinstance(optim_state_dict, dict):
+            raise TypeError("optimizer_state_dict must be a dict.")
+
+        state = optim_state_dict.get("state", None)
+        param_groups = optim_state_dict.get("param_groups", None)
+        if not isinstance(state, dict) or not isinstance(param_groups, list):
+            raise ValueError("Invalid optimizer_state_dict format: missing state/param_groups.")
+
+        expected_keys = set()
+        for group in param_groups:
+            if not isinstance(group, dict):
+                continue
+            for p in group.get("params", []):
+                if isinstance(p, str):
+                    expected_keys.add(p)
+
+        missing = [k for k in expected_keys if k not in state]
+        if missing:
+            raise RuntimeError(
+                "Optimizer state is incomplete; missing keys: "
+                f"{missing[:8]} (total={len(missing)})"
+            )
+
+    def _materialize_missing_optimizer_state(self, optim_state_dict):
+        """Fill missing AdamW per-parameter states before strict save."""
+        if not isinstance(optim_state_dict, dict):
+            raise TypeError("optimizer_state_dict must be a dict.")
+
+        state = optim_state_dict.get("state", None)
+        param_groups = optim_state_dict.get("param_groups", None)
+        if not isinstance(state, dict) or not isinstance(param_groups, list):
+            raise ValueError("Invalid optimizer_state_dict format: missing state/param_groups.")
+
+        expected_keys = set()
+        for group in param_groups:
+            if not isinstance(group, dict):
+                continue
+            for p in group.get("params", []):
+                if isinstance(p, str):
+                    expected_keys.add(p)
+
+        if not expected_keys:
+            return optim_state_dict
+
+        missing = [k for k in expected_keys if k not in state]
+        if not missing:
+            return optim_state_dict
+
+        named_params = {name: p for name, p in self.transformer.named_parameters()}
+        for fqn in missing:
+            param = named_params.get(fqn, None)
+            if param is None:
+                raise RuntimeError(f"Missing optimizer state for unknown parameter: {fqn}")
+            state[fqn] = {
+                "step": torch.tensor(0, dtype=torch.float32, device="cpu"),
+                "exp_avg": torch.zeros(
+                    param.shape,
+                    dtype=torch.float32,
+                    device="cpu",
+                ),
+                "exp_avg_sq": torch.zeros(
+                    param.shape,
+                    dtype=torch.float32,
+                    device="cpu",
+                ),
+            }
+
+        if self.config.rank == 0:
+            logger.warning(
+                f"Materialized optimizer state for {len(missing)} missing parameters before save."
+            )
+        return optim_state_dict
+
+    @torch.no_grad()
+    def _next_preview_batch(self):
+        if self.has_val_loader and self.val_loader is not None:
+            if self.val_preview_iter is None:
+                self.val_preview_iter = iter(self.val_loader)
+            try:
+                batch = next(self.val_preview_iter)
+            except StopIteration:
+                self.val_preview_iter = iter(self.val_loader)
+                batch = next(self.val_preview_iter)
+            return batch
+        return self._get_next_batch()
+
+    @torch.no_grad()
+    def _extract_preview_fps(self, raw_batch):
+        fps = raw_batch.get("video_fps", None) if isinstance(raw_batch, dict) else None
+        if fps is None:
+            return self.PREVIEW_VIDEO_FPS
+        if torch.is_tensor(fps):
+            if fps.numel() == 0:
+                return self.PREVIEW_VIDEO_FPS
+            return max(1, int(round(float(fps.flatten()[0].item()))))
+        return max(1, int(round(float(fps))))
+
+    @torch.no_grad()
+    def _save_preview_video(self, step: int):
+        if self.preview_vae is None:
+            return
+
+        raw_batch = self._next_preview_batch()
+        preview_fps = self._extract_preview_fps(raw_batch)
+        was_training = self.transformer.training
+        self.transformer.eval()
+        batch = self.convert_input_format(raw_batch)
+        input_dict = self._prepare_input_dict(batch)
+        output = self.transformer(input_dict, train_mode=True)
+        latent_pred = data_seq_to_patch(
+            self.patch_size,
+            output[0],
+            input_dict['latent_dict']['targets'].shape[-3],
+            input_dict['latent_dict']['targets'].shape[-2],
+            input_dict['latent_dict']['targets'].shape[-1],
+            batch_size=output[0].shape[0],
+        )
+        if was_training:
+            self.transformer.train()
+
+        latents = latent_pred[:1].to(self.preview_vae.dtype)
+
+        latents_mean = torch.tensor(
+            self.preview_vae.config.latents_mean,
+            device=latents.device,
+            dtype=latents.dtype,
+        ).view(1, self.preview_vae.config.z_dim, 1, 1, 1)
+        latents_std = 1.0 / torch.tensor(
+            self.preview_vae.config.latents_std,
+            device=latents.device,
+            dtype=latents.dtype,
+        ).view(1, self.preview_vae.config.z_dim, 1, 1, 1)
+
+        latents = latents / latents_std + latents_mean
+        video = self.preview_vae.decode(latents, return_dict=False)[0]
+        video = self.preview_video_processor.postprocess_video(video, output_type="np")[0]
+        save_path = self.preview_video_dir / f"pred_step_{step:08d}_rank{self.config.rank:02d}.mp4"
+        export_to_video(video, str(save_path), fps=preview_fps)
+
+    @torch.no_grad()
+    def validate_action_loss(self):
+        if not self.has_val_loader or self.val_loader is None:
+            return None
+
+        self.transformer.eval()
+        action_losses = []
+        for batch_idx, batch in enumerate(self.val_loader):
+            if self.val_eval_num_batches > 0 and batch_idx >= self.val_eval_num_batches:
+                break
+            batch = self.convert_input_format(batch)
+            input_dict = self._prepare_input_dict(batch)
+            output = self.transformer(input_dict, train_mode=True)
+            _, action_loss = self.compute_loss(input_dict, output)
+            action_losses.append(action_loss.detach() * self.gradient_accumulation_steps)
+
+        self.transformer.train()
+
+        if not action_losses:
+            return None
+
+        local_action_loss = torch.stack(action_losses).mean()
+        global_action_loss = dist_mean(local_action_loss).detach().cpu().item()
+        return global_action_loss
+
+    def _load_training_state(self):
+        """Load optimizer/step from experiment-level train state file."""
+        if not self.train_state_file.exists():
             if self.config.rank == 0:
-                logger.warning(f"Training state not found: {training_state_path}, starting from step 0")
+                logger.warning(
+                    f"Train state not found: {self.train_state_file}, "
+                    "optimizer state will be reset."
+                )
+            # Best effort: infer step from checkpoint folder name.
+            if self.resume_checkpoint_dir is not None:
+                name = self.resume_checkpoint_dir.name
+                if name.startswith("checkpoint_step_"):
+                    try:
+                        self.step = int(name.replace("checkpoint_step_", ""))
+                    except ValueError:
+                        self.step = 0
             return
 
         if self.config.rank == 0:
-            logger.info(f"Loading training state from {training_state_path}")
+            logger.info(f"Loading train state from {self.train_state_file}")
 
-        # All ranks load the training state directly
-        training_state = torch.load(training_state_path, map_location='cpu', weights_only=False)
+        training_state = torch.load(self.train_state_file, map_location='cpu', weights_only=False)
+        if "optimizer_state_dict" in training_state:
+            self._assert_optimizer_state_complete(training_state["optimizer_state_dict"])
 
-        # All ranks load optimizer state (required for FSDP)
-        set_optimizer_state_dict(
-            self.transformer, self.optimizer,
-            optim_state_dict=training_state['optimizer_state_dict'],
-            options=StateDictOptions(full_state_dict=True, strict=False)
-        )
-        self.step = training_state.get('step', 0)
+        if "optimizer_state_dict" in training_state:
+            set_optimizer_state_dict(
+                self.transformer,
+                self.optimizer,
+                optim_state_dict=training_state["optimizer_state_dict"],
+                options=StateDictOptions(full_state_dict=True, strict=False),
+            )
+
+        self.step = int(training_state.get("step", 0))
 
         if self.config.rank == 0:
             logger.info(f"Training state loaded, resuming from step {self.step}")
 
-        # Synchronize all ranks
         if dist.is_initialized():
             dist.barrier()
 
@@ -514,11 +843,35 @@ class Trainer:
                         self.writer.add_scalar('lr', lr, self.step)
                 
                 self.step += 1
+                if (
+                    self.enable_preview_video
+                    and self.preview_video_interval > 0
+                    and self.step % self.preview_video_interval == 0
+                ):
+                    try:
+                        self._save_preview_video(self.step)
+                    except Exception as e:
+                        logger.warning(f"Failed to save preview video at step {self.step}: {e}")
                 
                 if self.step % self.config.save_interval == 0:
                     if self.config.rank == 0:
                         logger.info(f"Starting save model at step {self.step}")
                     self.save_checkpoint()
+
+                if (
+                    self.enable_validation
+                    and self.val_interval > 0
+                    and self.step % self.val_interval == 0
+                ):
+                    val_action_loss = self.validate_action_loss()
+                    if self.config.rank == 0 and val_action_loss is not None:
+                        logger.info(f"[Val] step={self.step} action_loss={val_action_loss:.6f}")
+                        if self.writer is not None:
+                            self.writer.add_scalar(
+                                "val/action_loss",
+                                val_action_loss,
+                                self.step,
+                            )
 
             if self.enable_iter_barrier and dist.is_initialized():
                 dist.barrier()
@@ -546,9 +899,16 @@ def run(args):
 
     if args.save_root is not None:
         config.save_root = args.save_root
+    if args.dataset_path is not None:
+        config.dataset_path = args.dataset_path
+    if args.exp_name is not None:
+        config.exp_name = args.exp_name
+    if args.resume_from is not None:
+        config.resume_from = args.resume_from
 
     if rank == 0:
         logger.info(f"Using config: {args.config_name}")
+        logger.info(f"Experiment name: {getattr(config, 'exp_name', 'default_exp')}")
         logger.info(f"World size: {world_size}, Local rank: {local_rank}")
 
     trainer = Trainer(config)
@@ -569,6 +929,24 @@ def main():
         type=str,
         default=None,
         help="Root directory for saving checkpoints",
+    )
+    parser.add_argument(
+        "--dataset-path",
+        type=str,
+        default=None,
+        help="Dataset root path to override config.dataset_path",
+    )
+    parser.add_argument(
+        "--exp-name",
+        type=str,
+        default=None,
+        help="Experiment name under save_root.",
+    )
+    parser.add_argument(
+        "--resume-from",
+        type=str,
+        default=None,
+        help="Checkpoint directory to resume from, e.g. .../checkpoints/checkpoint_step_1000",
     )
 
     args = parser.parse_args()

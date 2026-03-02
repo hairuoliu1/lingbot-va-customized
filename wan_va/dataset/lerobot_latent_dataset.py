@@ -301,6 +301,10 @@ class LatentLeRobotDataset(LeRobotDataset):
         hf_data_frames = self._get_range_hf_data(start_frame, end_frame)
         ori_data_dict.update(hf_data_frames)
         out_dict = self._cat_video_latents(ori_data_dict)
+        out_dict["video_fps"] = torch.tensor(
+            float(ori_data_dict[f"{self.used_video_keys[0]}.fps"]),
+            dtype=torch.float32,
+        )
 
         out_dict['actions'], out_dict['actions_mask'] = self._action_post_process(local_start_frame, local_end_frame, latent_frame_ids, ori_data_dict['action'])
 
