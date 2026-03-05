@@ -1,15 +1,11 @@
 #!/usr/bin/bash
-
-set -x
-
-umask 007
  
-NGPU=${NGPU:-"8"}
+NGPU=${NGPU:-"1"}
 MASTER_PORT=${MASTER_PORT:-"29501"}
 PORT=${PORT:-"1106"}
 LOG_RANK=${LOG_RANK:-"0"}
 TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE:-"http://localhost:29510"}
-CONFIG_NAME=${CONFIG_NAME:-"robotwin"}
+CONFIG_NAME=${CONFIG_NAME:-"flexiv"}
 
 overrides=""
 if [ $# -ne 0 ]; then
@@ -30,5 +26,4 @@ python -m torch.distributed.run \
     --nproc_per_node=${num_gpu} \
     --local-ranks-filter=${log_rank} \
     --master_port ${master_port} \
-    --tee 3 \
     -m wan_va.wan_va_server --config-name ${config_name} $overrides
