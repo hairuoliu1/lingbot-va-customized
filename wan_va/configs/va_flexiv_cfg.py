@@ -15,7 +15,7 @@ va_flexiv_cfg.wan22_pretrained_model_name_or_path = "/inspire/hdd/global_user/li
 # [BOTH] Temporal attention window (in frames/chunks).
 va_flexiv_cfg.attn_window = 30
 # [BOTH] Number of frames generated/consumed per rollout chunk.
-va_flexiv_cfg.frame_chunk_size = 4
+va_flexiv_cfg.frame_chunk_size = 2
 # [BOTH] Environment adapter type, "none" means generic image/action pipeline.
 va_flexiv_cfg.env_type = "none"
 

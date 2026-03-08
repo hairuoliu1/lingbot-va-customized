@@ -83,7 +83,13 @@ class VA_Server:
             torch_dtype=self.dtype,
             torch_device=self.device,
         )
-        shard_fn = shard_model
+        world_size = int(getattr(job_config, "world_size", 1))
+        use_fsdp = os.getenv("WAN_VA_ENABLE_FSDP_INFER", "0") == "1" and world_size > 1
+        shard_fn = shard_model if use_fsdp else (lambda m: m)
+        logger.info(
+            f"[model init] world_size={world_size}, use_fsdp={use_fsdp}, "
+            f"dtype={self.dtype}, device={self.device}"
+        )
         self.transformer = _configure_model(model=self.transformer,
                                             shard_fn=shard_fn,
                                             param_dtype=self.dtype,
@@ -93,6 +99,7 @@ class VA_Server:
 
         self.env_type = job_config.env_type
         self.streaming_vae_half = None
+        self._has_reset = False
         if self.env_type == 'robotwin_tshape':
             vae_half = load_vae(
                 os.path.join(job_config.wan22_pretrained_model_name_or_path,
@@ -101,6 +108,48 @@ class VA_Server:
                 torch_device='cpu' if self.enable_offload else self.device,
             )
             self.streaming_vae_half = WanVAEStreamingWrapper(vae_half)
+
+    @staticmethod
+    def _to_rgb_hwc_uint8(image: np.ndarray) -> np.ndarray:
+        arr = np.asarray(image)
+        if arr.ndim != 3:
+            raise ValueError(f"Expected image with 3 dims, got shape={arr.shape}")
+
+        # OpenPI clients often send CHW float32 in [0, 1].
+        if arr.shape[0] in (1, 3) and arr.shape[-1] not in (1, 3):
+            arr = np.transpose(arr, (1, 2, 0))
+
+        if np.issubdtype(arr.dtype, np.floating):
+            max_val = float(np.nanmax(arr)) if arr.size > 0 else 0.0
+            if max_val <= 1.5:
+                arr = arr * 255.0
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+        return arr
+
+    def _adapt_openpi_request(self, obs: dict) -> tuple[dict, bool]:
+        # Already in native VA protocol.
+        if "obs" in obs or obs.get("reset", False) or obs.get("compute_kv_cache", False):
+            return obs, False
+
+        has_openpi_images = any(k.startswith("observation.images.") for k in obs.keys())
+        if not has_openpi_images:
+            return obs, False
+
+        native_obs = {}
+        for cam_key in self.job_config.obs_cam_keys:
+            if cam_key not in obs:
+                raise KeyError(f"Missing image key for OpenPI request: {cam_key}")
+            native_obs[cam_key] = self._to_rgb_hwc_uint8(obs[cam_key])
+
+        adapted = {"obs": native_obs}
+        if "prompt" in obs:
+            adapted["prompt"] = obs["prompt"]
+        return adapted, True
+
+    @staticmethod
+    def _action_chunk_to_openpi(action_chunk: np.ndarray) -> np.ndarray:
+        # [C, F, H] -> [F*H, C]
+        return action_chunk.transpose(1, 2, 0).reshape(-1, action_chunk.shape[0]).astype(np.float32)
 
     def _get_t5_prompt_embeds(
         self,
@@ -438,6 +487,7 @@ class VA_Server:
         self.exp_save_root = os.path.join(self.save_root, 'real', self.exp_name)
         os.makedirs(self.exp_save_root, exist_ok=True)
         torch.cuda.empty_cache()
+        self._has_reset = True
 
     def _infer(self, obs, frame_st_id=0):
         frame_chunk_size = self.job_config.frame_chunk_size
@@ -604,6 +654,7 @@ class VA_Server:
 
     @torch.no_grad()
     def infer(self, obs):
+        obs, openpi_mode = self._adapt_openpi_request(obs)
         reset = obs.get('reset', False)
         prompt = obs.get('prompt', None)
         compute_kv_cache = obs.get('compute_kv_cache', False)
@@ -612,7 +663,10 @@ class VA_Server:
             logger.info(f"******************* Reset server ******************")
             self._reset(prompt=prompt)
             return dict()
-        elif compute_kv_cache:
+        if not self._has_reset:
+            logger.info("No reset received yet; auto-resetting before first request.")
+            self._reset(prompt=prompt)
+        if compute_kv_cache:
             logger.info(
                 f"################# Compute KV Cache #################")
             self._compute_kv_cache(obs)
@@ -620,7 +674,11 @@ class VA_Server:
         else:
             logger.info(f"################# Infer One Chunk #################")
             action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
-            return dict(action=action)
+            result = dict(action=action)
+            # OpenPI-compatible action chunk (first dimension is horizon).
+            if openpi_mode:
+                result["actions"] = self._action_chunk_to_openpi(action)
+            return result
     
     def decode_one_video(self, latents, output_type):
         latents = latents.to(self.vae.dtype)

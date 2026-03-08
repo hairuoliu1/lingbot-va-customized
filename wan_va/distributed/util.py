@@ -9,10 +9,15 @@ def _configure_model(model, shard_fn, param_dtype, device, eval_mode=True):
     """
     if eval_mode:
         model.eval().requires_grad_(False)
-    if dist.is_initialized():
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    if dist.is_initialized() and world_size > 1:
         dist.barrier()
 
-    if dist.is_initialized():
+    # Only shard for true multi-GPU distributed runs.
+    if dist.is_initialized() and world_size > 1:
+        # Ensure FSDP sees a uniform original parameter dtype before fully_shard.
+        model.to(param_dtype)
+        model.to(device)
         model = shard_fn(model)
     else:
         model.to(param_dtype)
